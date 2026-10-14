@@ -4,36 +4,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository purpose
 
-This is not a software project — it is a working directory holding a single automation script and the data it produces. The script logs into AuthBridge's internal "MIS Query Browser" web app (`https://mis.authbridge.com/export_query/`) and downloads a client-specific tracker report that would otherwise be exported manually through the browser UI (login → select Host/Database/Data Time Slab/Query → set From/To dates → click Export).
+A small Streamlit app that builds the **Reliance Jio Infocomm Limited Tracker** report (client ID `171621`) by querying the **live AuthBridge MySQL database directly**. It replaces the old manual flow through the internal "MIS Query Browser" (`mis.authbridge.com/export_query/`), which is no longer used or scripted here. The report mirrors the old query's columns and column order.
 
-## Running the export
+## Files
+
+- `reliance_app.py` — Streamlit UI: pick "Case received from/to" dates, click **Generate report**, preview the first 200 rows, download CSV or Excel (Excel header row is bold on light gray).
+- `report_data.py` — data access and report assembly (`build_report(from_date, to_date)` returns a DataFrame).
+- `requirements.txt` — `requests`, `streamlit`, `pandas`, `pymysql`, `python-dotenv`, `openpyxl`.
+- `.env` — credentials (git-ignored, never commit). Keys: `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, plus `SMTP_HOST`, `SMTP_PORT`, `EMAIL_SENDER`, `EMAIL_PASSWORD` (SMTP keys are not currently used by the code).
+
+## Running
 
 ```
-python export_mis_query.py
+pip install -r requirements.txt
+python -m streamlit run reliance_app.py --server.port 8502
 ```
 
-No dependencies beyond `requests` (stdlib `zipfile`/`io`/`datetime` otherwise). There is no build, lint, or test tooling in this repo — it's a standalone script.
+Use a port other than the default 8501 (8502 is what has been used here). There is no build, lint, or test tooling; to check the data layer without the UI:
 
-The script writes two files into the working directory on each run:
-- `Reliance Jio Infocomm Limited Tracker client_code 2435.csv.zip` — raw response from the server
-- `Reliance Jio Infocomm Limited Tracker client_code 2435.csv` — extracted CSV (can be 100MB+; the full 2021-to-date range for this query produces ~150MB)
+```
+python -c "import datetime; from report_data import build_report; print(build_report(datetime.date(2026,10,1), datetime.date(2026,10,14)).shape)"
+```
 
-`TO_DATE` in the script is computed as `datetime.date.today()`, so every run exports up through the current date without edits.
+## How `report_data.py` works
 
-## How the target site works (relevant if extending the script)
+- Connects with `pymysql` using the `.env` credentials (30s connect timeout, 600s read timeout).
+- The original query ran ~60 correlated subqueries per case. It is now split into three set-based queries, all filtered by the same case predicate, then combined in pandas:
+  - `CASE_SQL` — one row per case from `ec_case_master` joined to company, process, location, candidate and flex fields.
+  - `CHECKS_SQL` — rows from `ec_case_checks`, joined to verification sources (this can fan a check out into several rows, so `case_check_id` is de-duplicated where it matters).
+  - `REPORTS_SQL` — sent reports (`report_status = 5`, `report_type` 0/1/2) from `ec_case_reports`; the highest `case_report_id` per case and type is the latest.
+- Case filter: `client_id = 171621`, `received_date` in `[from, to + 1 day)`, `case_status NOT IN (8, 14)`, and candidates not named `dummy`.
+- Lookup dicts (`CASE_STATUS`, `DATA_SOURCE`, `CHECK_STATUS`) translate numeric codes to labels. `CHECK_COLUMNS` defines the per-check pivot columns (check ID, label, number of columns); extra columns are labelled `label (n)`.
+- Date aggregation (`_latest_date`) converts columns to datetime with `errors="coerce"` before taking the max — the DB returns mixed types (dates, strings, zero-dates) in these object columns and a plain `max` fails.
 
-The MIS Query Browser (`export_query/home.php`) is a legacy PHP form with cascading, AJAX-populated dropdowns. To submit a new/different export, the same sequence of dependent requests must be resolved in order — you can't just guess IDs:
+## Extending
 
-1. **Login**: `POST login.php` with `username`, `password`, `login` fields. A successful login redirects to `home.php`.
-2. **Host → Database**: selecting a Host `<select name="hostname">` fires `GET host_ajax.php?host_id=<id>`, which returns the `<select name="database">` options valid for that host (values are internal DB names like `checkpoint_live`, not the display labels).
-3. **Data Time Slab → Query**: selecting `<select name="access_time">` fires `GET time_ajax.php?access_time=<slab name>`, returning the `<select name="csv_query">` options (each option value is a numeric query ID, e.g. `1500` for the Reliance Jio tracker).
-4. **Query → date fields**: selecting `csv_query` fires `GET ajax.php?query=<id>`, which returns the Query Level, Days Range, and the `date1`/`date2` text inputs for that query.
-5. **Export**: the whole form is `POST`ed to `process.php` with `hostname`, `database`, `access_time`, `csv_query`, `query_days_range`, `date1`, `date2`. The response body is the export file directly (a zip containing one CSV) — not a redirect or a job you poll for.
-
-Large date ranges can take several minutes server-side before `process.php` responds; the request has no async/progress endpoint, so the client just blocks on the POST (the script uses a 600s timeout).
-
-To export a different query/client, find its numeric `csv_query` ID and the `database`/`access_time` values by walking the same AJAX chain (e.g. via browser devtools or by replaying steps 2–4 above), then swap the constants at the top of `export_mis_query.py`.
+- To change the client, edit `CLIENT_ID` in `report_data.py`.
+- To add or remove check columns, edit `CHECK_COLUMNS`, then check the column ordering at the end of `build_report`.
+- Large date ranges can take a while because the queries run synchronously; the UI shows a spinner.
 
 ## Credentials
 
-The AuthBridge MIS username/password are hardcoded as constants (`USERNAME`, `PASSWORD`) at the top of `export_mis_query.py`. This is an internal-only working directory, not a shared/public repo — if this script is ever moved into a shared repository, pull credentials out into environment variables first.
+Credentials live only in `.env` (git-ignored). Do not hardcode them or commit them. The repo is pushed to https://github.com/Jay1804/Reliance-Jio-tracker-report.

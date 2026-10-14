@@ -1,0 +1,6 @@
+requests>=2.34.2
+streamlit
+pandas
+pymysql
+python-dotenv
+openpyxl
